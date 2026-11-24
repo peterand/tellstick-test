@@ -1,15 +1,15 @@
 /*
- * Tellstick Net v2 (PIC18F67J60) - UDP discovery responder, bare-metal.
+ * Tellstick Net v2 (PIC18F67J60) - DHCP client + UDP discovery responder.
  *
- * Listens for UDP packets to 255.255.255.255 (or our own IP) port 30303 and
- * answers the sender with "Hello Peter" to UDP destination port 2048.
+ * - Gets its IPv4 address via DHCP (DISCOVER/OFFER/REQUEST/ACK, renews at
+ *   half the lease, restarts if the lease expires or a NAK arrives).
+ * - Listens for UDP to 255.255.255.255 (or its own IP) port 30303 and answers
+ *   the sender with "Hello Peter" to UDP destination port 2048.
+ * - Answers ARP for its IP.
  *
- * Uses the PIC's internal Ethernet MAC/PHY directly (no Microchip TCP/IP
- * stack). Answers ARP for our IP so the box is pingable-ish at L2 and other
- * hosts can resolve it. Static IP, no DHCP.
- *
- * Toolchain: MPLAB X + XC8, device PIC18F67J60. Assumes a 25 MHz crystal
- * (required by the internal Ethernet PHY) - verify on your board.
+ * Bare-metal on the PIC's internal Ethernet MAC/PHY (no Microchip TCP/IP
+ * stack). Toolchain: MPLAB X + XC8, device PIC18F67J60. Assumes a 25 MHz
+ * crystal (required by the internal Ethernet PHY) - verify on your board.
  */
 #include <xc.h>
 #include <stdint.h>
@@ -21,14 +21,17 @@
 
 /* ---- user settings ---- */
 static const uint8_t MY_MAC[6] = {0x02, 0x54, 0x45, 0x4C, 0x4C, 0x01}; /* locally administered */
-static const uint8_t MY_IP[4]  = {192, 168, 1, 50};                    /* CHANGE to fit your LAN */
 #define LISTEN_PORT  30303u
 #define REPLY_PORT   2048u
 static const char REPLY_TEXT[] = "Hello Peter";
 
+/* Timer0: 16-bit, 1:256, Fcy = 10.4167 MHz -> overflow every ~1.61 s.
+ * All DHCP timing is counted in these ticks. */
+#define TICK_X10      16u        /* tick length in 1/10 s */
+#define T0CON_VAL     0x87       /* TMR0ON, 16-bit, internal clock, prescaler 1:256 */
+
 /* ---- register bit masks ---- */
 #define ECON1_TXRST   0x80
-#define ECON1_RXRST   0x40
 #define ECON1_TXRTS   0x08
 #define ECON1_RXEN    0x04
 #define ECON2_PKTDEC  0x40
@@ -37,6 +40,7 @@ static const char REPLY_TEXT[] = "Hello Peter";
 #define EIR_TXIF      0x08
 #define EIR_TXERIF    0x02
 #define MISTAT_BUSY   0x01
+#define INTCON_TMR0IF 0x04
 #define PHCON2        0x10
 #define PHCON2_HDLDIS 0x0100
 
@@ -45,11 +49,13 @@ static const char REPLY_TEXT[] = "Hello Peter";
 #define RXSTOP  0x19FFu          /* odd */
 #define TXSTART 0x1A00u
 
-#define RXBUF_LEN 64u            /* we only need headers */
+#define RXBUF_LEN 80u            /* headers only; DHCP options are streamed */
 #define TXBUF_LEN 80u
 
-static uint8_t rx[RXBUF_LEN];
-static uint8_t tx[TXBUF_LEN];
+static uint8_t  rx[RXBUF_LEN];
+static uint8_t  tx[TXBUF_LEN];
+static uint16_t rx_len;          /* full frame length without CRC */
+static uint16_t rx_buffered;     /* bytes of it copied into rx[] */
 static uint16_t next_packet = RXSTART;
 
 /* ---------------------------------------------------------------- PHY --- */
@@ -68,7 +74,6 @@ static void eth_init(void)
     while (!(ESTAT & ESTAT_PHYRDY)) { }     /* wait for 25 MHz oscillator/PHY */
     ECON2 |= ECON2_ETHEN;                   /* enable Ethernet module */
 
-    /* receive buffer */
     ERXSTL = RXSTART & 0xFF;  ERXSTH = RXSTART >> 8;
     ERXNDL = RXSTOP & 0xFF;   ERXNDH = RXSTOP >> 8;
     ERXRDPTL = RXSTOP & 0xFF; ERXRDPTH = RXSTOP >> 8;
@@ -97,43 +102,44 @@ static void eth_init(void)
 }
 
 /* ---------------------------------------------------------------- RX ----- */
-/* Returns frame length copied into rx[] (0 = nothing received). */
-static uint16_t eth_receive(void)
+/* If a frame is waiting: reads its header and the first RXBUF_LEN bytes into
+ * rx[], leaves the ETH read pointer right after them (so further EDATA reads
+ * stream the rest of the frame), and returns 1. Call eth_release() when done. */
+static uint8_t eth_poll(void)
 {
-    uint16_t len, status_next, cnt;
-    uint8_t  i;
+    uint16_t len, i;
 
     if (EPKTCNT == 0) return 0;
 
     ERDPTL = next_packet & 0xFF;
     ERDPTH = next_packet >> 8;
 
-    status_next  = EDATA;                   /* next packet pointer */
-    status_next |= (uint16_t)EDATA << 8;
+    next_packet  = EDATA;                   /* next packet pointer */
+    next_packet |= (uint16_t)EDATA << 8;
     len  = EDATA;                           /* byte count (incl. 4-byte CRC) */
     len |= (uint16_t)EDATA << 8;
     (void)EDATA; (void)EDATA;               /* receive status */
 
-    cnt = (len > 4) ? len - 4 : 0;
-    if (cnt > RXBUF_LEN) cnt = RXBUF_LEN;
-    for (i = 0; i < cnt; i++) rx[i] = EDATA;
+    rx_len = (len > 4) ? len - 4 : 0;
+    rx_buffered = (rx_len > RXBUF_LEN) ? RXBUF_LEN : rx_len;
+    for (i = 0; i < rx_buffered; i++) rx[i] = EDATA;
+    return 1;
+}
 
+static void eth_release(void)
+{
     /* free the buffer space; ERXRDPT must be odd (errata) */
-    next_packet = status_next;
-    {
-        uint16_t rd = (status_next == RXSTART) ? RXSTOP : status_next - 1;
-        ERXRDPTL = rd & 0xFF;
-        ERXRDPTH = rd >> 8;
-    }
+    uint16_t rd = (next_packet == RXSTART) ? RXSTOP : (uint16_t)(next_packet - 1);
+    ERXRDPTL = rd & 0xFF;
+    ERXRDPTH = rd >> 8;
     ECON2 |= ECON2_PKTDEC;
-    return cnt;
 }
 
 /* ---------------------------------------------------------------- TX ----- */
-static void eth_send(const uint8_t *buf, uint16_t len)
+/* Start a frame of 'len' bytes; then write bytes to EDATA; then eth_tx_go(). */
+static void eth_tx_start(uint16_t len)
 {
     uint16_t end = TXSTART + len;           /* control byte at TXSTART, frame follows */
-    uint16_t i;
 
     /* errata: reset TX logic if a previous transmit errored */
     if (EIR & EIR_TXERIF) {
@@ -141,16 +147,24 @@ static void eth_send(const uint8_t *buf, uint16_t len)
         ECON1 &= ~ECON1_TXRST;
         EIR &= ~(EIR_TXERIF | EIR_TXIF);
     }
-
     EWRPTL = TXSTART & 0xFF;  EWRPTH = TXSTART >> 8;
     ETXSTL = TXSTART & 0xFF;  ETXSTH = TXSTART >> 8;
     ETXNDL = end & 0xFF;      ETXNDH = end >> 8;
-
     EDATA = 0;                              /* per-packet control: use MACON3 defaults */
-    for (i = 0; i < len; i++) EDATA = buf[i];
+}
 
+static void eth_tx_go(void)
+{
     ECON1 |= ECON1_TXRTS;
     while (ECON1 & ECON1_TXRTS) { }         /* wait until sent (or aborted) */
+}
+
+static void eth_send(const uint8_t *buf, uint16_t len)
+{
+    uint16_t i;
+    eth_tx_start(len);
+    for (i = 0; i < len; i++) EDATA = buf[i];
+    eth_tx_go();
 }
 
 /* ------------------------------------------------------------ helpers ---- */
@@ -163,22 +177,184 @@ static uint16_t ip_checksum(const uint8_t *p, uint8_t len)
     return (uint16_t)~sum;
 }
 
-static uint8_t is_broadcast_ip(const uint8_t *ip)
+/* ================================================================ DHCP === */
+enum { S_INIT, S_SELECTING, S_REQUESTING, S_BOUND, S_RENEWING };
+
+static uint8_t  state = S_INIT;
+static uint8_t  my_ip[4];            /* valid in S_BOUND / S_RENEWING */
+static uint8_t  offered_ip[4];
+static uint8_t  server_id[4];
+static uint8_t  xid[4];
+static uint8_t  wait_ticks;          /* ticks since last request was sent */
+static uint32_t elapsed;             /* ticks since lease start */
+static uint32_t lease_ticks;
+
+#define DHCP_COOKIE_OFFSET 278u      /* 14 eth + 20 ip + 8 udp + 236 bootp; options follow the 4-byte cookie */
+
+static uint8_t has_ip(void)
 {
-    return ip[0] == 255 && ip[1] == 255 && ip[2] == 255 && ip[3] == 255;
+    return state == S_BOUND || state == S_RENEWING;
 }
 
-static uint8_t is_my_ip(const uint8_t *ip)
+/* msg: 1 DISCOVER, 3 REQUEST. req_ip/srv_id: options 50/54 (or NULL).
+ * ciaddr: our current IP when renewing (or NULL). */
+static void dhcp_send(uint8_t msg, const uint8_t *req_ip, const uint8_t *srv_id,
+                      const uint8_t *ciaddr)
 {
-    return memcmp(ip, MY_IP, 4) == 0;
+    uint8_t  opt_len = 3 + 4 + 1;                 /* 53, 55(1,3), end */
+    uint16_t udp_len, ip_len, total, csum;
+    uint8_t  i;
+
+    if (req_ip) opt_len += 6;
+    if (srv_id) opt_len += 6;
+    udp_len = 8 + 240 + opt_len;
+    ip_len  = 20 + udp_len;
+    total   = 14 + ip_len;
+
+    memset(tx, 0, 42);
+    memset(&tx[0], 0xFF, 6);                      /* broadcast */
+    memcpy(&tx[6], MY_MAC, 6);
+    tx[12] = 0x08; tx[13] = 0x00;
+    tx[14] = 0x45;
+    tx[16] = ip_len >> 8; tx[17] = (uint8_t)ip_len;
+    tx[22] = 128; tx[23] = 17;
+    if (ciaddr) memcpy(&tx[26], ciaddr, 4);       /* src 0.0.0.0 otherwise */
+    memset(&tx[30], 0xFF, 4);                     /* dst 255.255.255.255 */
+    csum = ip_checksum(&tx[14], 20);
+    tx[24] = csum >> 8; tx[25] = (uint8_t)csum;
+    tx[34] = 0; tx[35] = 68;                      /* src port 68 */
+    tx[36] = 0; tx[37] = 67;                      /* dst port 67 */
+    tx[38] = udp_len >> 8; tx[39] = (uint8_t)udp_len;
+
+    eth_tx_start(total);
+    for (i = 0; i < 42; i++) EDATA = tx[i];
+
+    /* BOOTP fixed part */
+    EDATA = 1; EDATA = 1; EDATA = 6; EDATA = 0;   /* op, htype, hlen, hops */
+    for (i = 0; i < 4; i++) EDATA = xid[i];
+    EDATA = 0; EDATA = 0;                         /* secs */
+    EDATA = 0x80; EDATA = 0;                      /* flags: broadcast reply */
+    for (i = 0; i < 4; i++) EDATA = ciaddr ? ciaddr[i] : 0;
+    for (i = 0; i < 12; i++) EDATA = 0;           /* yiaddr, siaddr, giaddr */
+    for (i = 0; i < 6; i++) EDATA = MY_MAC[i];    /* chaddr */
+    for (i = 0; i < 10; i++) EDATA = 0;           /* chaddr padding */
+    for (i = 0; i < 192; i++) EDATA = 0;          /* sname + file */
+    EDATA = 0x63; EDATA = 0x82; EDATA = 0x53; EDATA = 0x63;
+
+    EDATA = 53; EDATA = 1; EDATA = msg;
+    if (req_ip) { EDATA = 50; EDATA = 4; for (i = 0; i < 4; i++) EDATA = req_ip[i]; }
+    if (srv_id) { EDATA = 54; EDATA = 4; for (i = 0; i < 4; i++) EDATA = srv_id[i]; }
+    EDATA = 55; EDATA = 2; EDATA = 1; EDATA = 3;  /* want subnet mask, router */
+    EDATA = 255;
+
+    eth_tx_go();
+}
+
+static void dhcp_start(void)
+{
+    xid[0] = MY_MAC[2]; xid[1] = MY_MAC[3]; xid[2] = MY_MAC[4];
+    xid[3]++;                                     /* new transaction */
+    state = S_SELECTING;
+    wait_ticks = 0;
+    dhcp_send(1, 0, 0, 0);
+}
+
+/* Called about every 1.6 s. */
+static void dhcp_tick(void)
+{
+    switch (state) {
+    case S_INIT:
+        dhcp_start();
+        break;
+    case S_SELECTING:
+    case S_REQUESTING:
+        if (++wait_ticks >= 3) dhcp_start();      /* no answer: start over */
+        break;
+    case S_BOUND:
+        if (++elapsed >= (lease_ticks >> 1)) {    /* T1: renew */
+            xid[3]++;
+            state = S_RENEWING;
+            wait_ticks = 0;
+            dhcp_send(3, 0, 0, my_ip);
+        }
+        break;
+    case S_RENEWING:
+        ++elapsed;
+        if (elapsed >= lease_ticks) {             /* lease lost */
+            memset(my_ip, 0, 4);
+            dhcp_start();
+        } else if (++wait_ticks >= 3) {
+            wait_ticks = 0;
+            dhcp_send(3, 0, 0, my_ip);
+        }
+        break;
+    }
+}
+
+/* Returns 1 if the frame was a DHCP packet (UDP dst port 68), else 0. */
+static uint8_t dhcp_rx(void)
+{
+    uint16_t i, pos;
+    uint8_t  code, olen, n, b, type = 0;
+    uint8_t  optb[4], srv[4], cookie[4];
+    uint8_t  have_srv = 0;
+    uint32_t lease = 0;
+
+    if (rx_buffered < 62 || rx[14] != 0x45 || rx[23] != 17) return 0;
+    if (rx[36] != 0 || rx[37] != 68) return 0;
+    if (rx_len < 286 || rx_buffered < RXBUF_LEN) return 1;
+    if (rx[42] != 2 || memcmp(&rx[46], xid, 4) != 0) return 1;  /* BOOTREPLY, our xid */
+
+    /* ETH read pointer is at byte RXBUF_LEN: skip to the magic cookie */
+    for (i = RXBUF_LEN; i < DHCP_COOKIE_OFFSET; i++) (void)EDATA;
+    for (n = 0; n < 4; n++) cookie[n] = EDATA;
+    if (cookie[0] != 0x63 || cookie[1] != 0x82 || cookie[2] != 0x53 || cookie[3] != 0x63)
+        return 1;
+
+    pos = DHCP_COOKIE_OFFSET + 4;
+    while (pos < rx_len) {
+        code = EDATA; pos++;
+        if (code == 255) break;
+        if (code == 0) continue;
+        if (pos >= rx_len) break;
+        olen = EDATA; pos++;
+        for (n = 0; n < olen; n++) { b = EDATA; if (n < 4) optb[n] = b; }
+        pos += olen;
+        if (code == 53 && olen >= 1) type = optb[0];
+        else if (code == 54 && olen == 4) { memcpy(srv, optb, 4); have_srv = 1; }
+        else if (code == 51 && olen == 4)
+            lease = ((uint32_t)optb[0] << 24) | ((uint32_t)optb[1] << 16)
+                  | ((uint16_t)optb[2] << 8) | optb[3];
+    }
+
+    if (type == 2 && state == S_SELECTING && have_srv) {          /* OFFER */
+        memcpy(offered_ip, &rx[58], 4);                           /* yiaddr */
+        memcpy(server_id, srv, 4);
+        state = S_REQUESTING;
+        wait_ticks = 0;
+        dhcp_send(3, offered_ip, server_id, 0);
+    } else if (type == 5 && (state == S_REQUESTING || state == S_RENEWING)) { /* ACK */
+        if (state == S_REQUESTING) memcpy(my_ip, &rx[58], 4);
+        if (lease == 0) lease = 3600;
+        lease_ticks = (lease / TICK_X10) * 10;                    /* seconds -> ticks */
+        if (lease_ticks < 4) lease_ticks = 4;
+        elapsed = 0;
+        wait_ticks = 0;
+        state = S_BOUND;
+    } else if (type == 6) {                                       /* NAK */
+        memset(my_ip, 0, 4);
+        dhcp_start();
+    }
+    return 1;
 }
 
 /* --------------------------------------------------------------- ARP ----- */
 static void handle_arp(void)
 {
     /* rx: eth(14) + arp(28). op at 20..21, sender MAC 22, sender IP 28, target IP 38 */
+    if (!has_ip() || rx_buffered < 42) return;
     if (rx[20] != 0 || rx[21] != 1) return;         /* not a request */
-    if (!is_my_ip(&rx[38])) return;
+    if (memcmp(&rx[38], my_ip, 4) != 0) return;
 
     memcpy(&tx[0], &rx[6], 6);                      /* dst = requester */
     memcpy(&tx[6], MY_MAC, 6);
@@ -186,25 +362,27 @@ static void handle_arp(void)
     tx[14] = 0; tx[15] = 1; tx[16] = 0x08; tx[17] = 0; tx[18] = 6; tx[19] = 4;
     tx[20] = 0; tx[21] = 2;                         /* reply */
     memcpy(&tx[22], MY_MAC, 6);
-    memcpy(&tx[28], MY_IP, 4);
+    memcpy(&tx[28], my_ip, 4);
     memcpy(&tx[32], &rx[22], 6);
     memcpy(&tx[38], &rx[28], 4);
     eth_send(tx, 42);
 }
 
 /* --------------------------------------------------------------- UDP ----- */
-static void handle_ip(uint16_t len)
+static void handle_ip(void)
 {
     uint8_t  ihl;
     uint16_t dport, plen, csum;
     uint8_t  o;
+    static const uint8_t bcast[4] = {255, 255, 255, 255};
 
-    if (len < 14 + 20 + 8) return;
+    if (!has_ip()) return;
+    if (rx_len < 14 + 20 + 8) return;
     if ((rx[14] >> 4) != 4) return;
     ihl = (rx[14] & 0x0F) * 4;
-    if (ihl < 20 || len < (uint16_t)(14 + ihl + 8)) return;
+    if (ihl < 20 || (uint16_t)(14 + ihl + 4) > rx_buffered) return;
     if (rx[14 + 9] != 17) return;                   /* UDP only */
-    if (!is_broadcast_ip(&rx[14 + 16]) && !is_my_ip(&rx[14 + 16])) return;
+    if (memcmp(&rx[14 + 16], bcast, 4) != 0 && memcmp(&rx[14 + 16], my_ip, 4) != 0) return;
 
     dport = ((uint16_t)rx[14 + ihl + 2] << 8) | rx[14 + ihl + 3];
     if (dport != LISTEN_PORT) return;
@@ -222,7 +400,7 @@ static void handle_ip(uint16_t len)
     tx[o + 6] = 0; tx[o + 7] = 0;                   /* flags/frag */
     tx[o + 8] = 64; tx[o + 9] = 17;                 /* ttl, UDP */
     tx[o + 10] = 0; tx[o + 11] = 0;                 /* checksum placeholder */
-    memcpy(&tx[o + 12], MY_IP, 4);
+    memcpy(&tx[o + 12], my_ip, 4);
     memcpy(&tx[o + 16], &rx[14 + 12], 4);           /* dst IP = sender IP */
     csum = ip_checksum(&tx[o], 20);
     tx[o + 10] = csum >> 8; tx[o + 11] = (uint8_t)csum;
@@ -240,15 +418,23 @@ static void handle_ip(uint16_t len)
 /* -------------------------------------------------------------- main ----- */
 void main(void)
 {
-    uint16_t len;
-
     eth_init();
+    T0CON = T0CON_VAL;
+    INTCON &= ~INTCON_TMR0IF;
+    dhcp_start();
 
     for (;;) {
-        len = eth_receive();
-        if (len < 14) continue;
+        if (INTCON & INTCON_TMR0IF) {
+            INTCON &= ~INTCON_TMR0IF;
+            dhcp_tick();
+        }
 
-        if (rx[12] == 0x08 && rx[13] == 0x06 && len >= 42) handle_arp();
-        else if (rx[12] == 0x08 && rx[13] == 0x00)         handle_ip(len);
+        if (eth_poll()) {
+            if (rx_buffered >= 14) {
+                if (rx[12] == 0x08 && rx[13] == 0x06)      handle_arp();
+                else if (rx[12] == 0x08 && rx[13] == 0x00) { if (!dhcp_rx()) handle_ip(); }
+            }
+            eth_release();
+        }
     }
 }
