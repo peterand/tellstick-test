@@ -20,7 +20,7 @@
 #pragma config XINST = OFF, DEBUG = OFF, STVR = ON
 
 /* ---- user settings ---- */
-static const uint8_t MY_MAC[6] = {0x02, 0x54, 0x45, 0x4C, 0x4C, 0x01}; /* locally administered */
+static const uint8_t MY_MAC[6] = {0xac, 0xca, 0x54, 0x00, 0x6C, 0xac}; /* locally administered */
 #define LISTEN_PORT  30303u
 #define REPLY_PORT   2048u
 static const char REPLY_TEXT[] = "Hello Peter";
