@@ -25,10 +25,10 @@ static const uint8_t MY_MAC[6] = {0x02, 0x54, 0x45, 0x4C, 0x4C, 0x01}; /* locall
 #define REPLY_PORT   2048u
 static const char REPLY_TEXT[] = "Hello Peter";
 
-/* Timer0: 16-bit, 1:256, Fcy = 10.4167 MHz -> overflow every ~1.61 s.
- * All DHCP timing is counted in these ticks. */
-#define TICK_X10      16u        /* tick length in 1/10 s */
-#define T0CON_VAL     0x87       /* TMR0ON, 16-bit, internal clock, prescaler 1:256 */
+/* Timer0: 16-bit, 1:64, Fcy = 10.4167 MHz (after OSCTUNE PLL) -> overflow
+ * every ~0.40 s. DHCP timing and the RX polarity swap are counted in ticks. */
+#define T0CON_VAL     0x85       /* TMR0ON, 16-bit, internal clock, prescaler 1:64 */
+#define DHCP_RETRY_TICKS 12u     /* ~4.8 s */
 
 /* ---- register bit masks ---- */
 #define ECON1_TXRST   0x80
@@ -41,6 +41,12 @@ static const char REPLY_TEXT[] = "Hello Peter";
 #define EIR_TXERIF    0x02
 #define MISTAT_BUSY   0x01
 #define INTCON_TMR0IF 0x04
+#define LATE_RXPOL    0x02       /* RE1 = Ethernet RX polarity swap on this board */
+#define PHCON1        0x00
+#define PHSTAT2       0x11
+#define PHSTAT2_LSTAT 0x0400
+#define PHLCON        0x14
+#define PHCON2_RXAPDIS 0x0010
 #define PHCON2        0x10
 #define PHCON2_HDLDIS 0x0100
 
@@ -62,17 +68,84 @@ static uint16_t next_packet = RXSTART;
 static void phy_write(uint8_t reg, uint16_t val)
 {
     MIREGADR = reg;
-    MIWRL = (uint8_t)val;
-    MIWRH = (uint8_t)(val >> 8);
+    /* Silicon errata: MIWRL is corrupted if a register whose address ends in
+     * 0x16 is accessed between the MIWRL and MIWRH writes. Copy via PRODL/PRODH
+     * and use MOVFF so the compiler can't insert other accesses. */
+    PRODL = (uint8_t)val;
+    PRODH = (uint8_t)(val >> 8);
+    asm("movff PRODL, MIWRL");
+    asm("nop");
+    asm("movff PRODH, MIWRH");
     while (MISTAT & MISTAT_BUSY) { }
+}
+
+static uint16_t phy_read(uint8_t reg)
+{
+    uint16_t v;
+    MIREGADR = reg;
+    MICMD = 0x01;                           /* MIIRD */
+    while (MISTAT & MISTAT_BUSY) { }
+    MICMD = 0;
+    v = MIRDL;
+    v |= (uint16_t)MIRDH << 8;
+    return v;
+}
+
+/* --------------------------------------------- RX polarity swap (RE1) ----
+ * The board can invert the PHY's RX pair via RE1. Like Microchip's driver, we
+ * flip it while the link is up but no frame has ever been received, holding
+ * each setting for >= 1 tick (~0.4 s) after every transmit so a reply can
+ * arrive with the polarity that was in effect when we sent. */
+static uint8_t pol_valid, pol_on_tx, pol_next_tx, pol_timer;
+
+static void pol_set(uint8_t v)
+{
+    if (v) LATE |= LATE_RXPOL; else LATE &= ~LATE_RXPOL;
+}
+
+static uint8_t link_up(void)
+{
+    return (phy_read(PHSTAT2) & PHSTAT2_LSTAT) != 0;
+}
+
+/* call once per Timer0 tick */
+static void pol_tick(void)
+{
+    if (pol_timer < 255) pol_timer++;
+    if (pol_timer >= 2) {
+        if (link_up()) {
+            if (!pol_valid) pol_set(!(LATE & LATE_RXPOL));
+        } else {
+            pol_valid = 0;
+            pol_next_tx = 0;
+            pol_set(0);                     /* IEEE 802.3 polarity */
+        }
+        pol_timer = 0;
+        pol_on_tx = 0;
+    }
+}
+
+/* call right before starting a transmit */
+static void pol_on_transmit(void)
+{
+    if (!pol_valid && !pol_on_tx) {
+        pol_timer = 0;
+        pol_on_tx = 1;
+        pol_set(pol_next_tx);
+        pol_next_tx ^= 1;
+    }
 }
 
 /* ------------------------------------------------------------- ETH init -- */
 static void eth_init(void)
 {
+    TRISA &= 0xFC;                          /* RA0/RA1 = Ethernet LED outputs */
+    TRISE &= ~LATE_RXPOL;                   /* RE1 = RX polarity swap output */
+    pol_set(0);
+
     ECON1 = 0;                              /* RX and TX off */
-    while (!(ESTAT & ESTAT_PHYRDY)) { }     /* wait for 25 MHz oscillator/PHY */
-    ECON2 |= ECON2_ETHEN;                   /* enable Ethernet module */
+    ECON2 |= ECON2_ETHEN;                   /* enable Ethernet module FIRST ... */
+    while (!(ESTAT & ESTAT_PHYRDY)) { }     /* ... PHYRDY only sets after ETHEN */
 
     ERXSTL = RXSTART & 0xFF;  ERXSTH = RXSTART >> 8;
     ERXNDL = RXSTOP & 0xFF;   ERXNDH = RXSTOP >> 8;
@@ -96,7 +169,10 @@ static void eth_init(void)
     MAADR1 = MY_MAC[0]; MAADR2 = MY_MAC[1]; MAADR3 = MY_MAC[2];
     MAADR4 = MY_MAC[3]; MAADR5 = MY_MAC[4]; MAADR6 = MY_MAC[5];
 
-    phy_write(PHCON2, PHCON2_HDLDIS);       /* no half-duplex loopback */
+    /* no half-duplex loopback; RXAPDIS per silicon errata */
+    phy_write(PHCON2, PHCON2_HDLDIS | PHCON2_RXAPDIS);
+    phy_write(PHLCON, 0x3472);              /* LEDA = link, LEDB = activity */
+    phy_write(PHCON1, 0x0000);              /* half duplex */
 
     ECON1 |= ECON1_RXEN;                    /* start receiving */
 }
@@ -123,6 +199,7 @@ static uint8_t eth_poll(void)
     rx_len = (len > 4) ? len - 4 : 0;
     rx_buffered = (rx_len > RXBUF_LEN) ? RXBUF_LEN : rx_len;
     for (i = 0; i < rx_buffered; i++) rx[i] = EDATA;
+    pol_valid = 1;                          /* RX works: stop swapping polarity */
     return 1;
 }
 
@@ -141,12 +218,6 @@ static void eth_tx_start(uint16_t len)
 {
     uint16_t end = TXSTART + len;           /* control byte at TXSTART, frame follows */
 
-    /* errata: reset TX logic if a previous transmit errored */
-    if (EIR & EIR_TXERIF) {
-        ECON1 |= ECON1_TXRST;
-        ECON1 &= ~ECON1_TXRST;
-        EIR &= ~(EIR_TXERIF | EIR_TXIF);
-    }
     EWRPTL = TXSTART & 0xFF;  EWRPTH = TXSTART >> 8;
     ETXSTL = TXSTART & 0xFF;  ETXSTH = TXSTART >> 8;
     ETXNDL = end & 0xFF;      ETXNDH = end >> 8;
@@ -155,8 +226,20 @@ static void eth_tx_start(uint16_t len)
 
 static void eth_tx_go(void)
 {
+    volatile uint8_t d = 8;
+    uint16_t n = 0;
+
+    /* errata: reset the TX logic before every transmit, then wait >= 1.6 us */
+    ECON1 |= ECON1_TXRST;
+    ECON1 &= ~ECON1_TXRST;
+    while (d--) { }
+    EIR &= ~(EIR_TXERIF | EIR_TXIF);
+
+    pol_on_transmit();
+
     ECON1 |= ECON1_TXRTS;
-    while (ECON1 & ECON1_TXRTS) { }         /* wait until sent (or aborted) */
+    while ((ECON1 & ECON1_TXRTS) && ++n < 30000u) { }   /* wait until sent */
+    if (ECON1 & ECON1_TXRTS) ECON1 &= ~ECON1_TXRTS;     /* stuck (no link?): give up */
 }
 
 static void eth_send(const uint8_t *buf, uint16_t len)
@@ -264,11 +347,11 @@ static void dhcp_tick(void)
 {
     switch (state) {
     case S_INIT:
-        dhcp_start();
+        if (link_up()) dhcp_start();              /* wait for a link first */
         break;
     case S_SELECTING:
     case S_REQUESTING:
-        if (++wait_ticks >= 3) dhcp_start();      /* no answer: start over */
+        if (++wait_ticks >= DHCP_RETRY_TICKS) dhcp_start();  /* no answer: start over */
         break;
     case S_BOUND:
         if (++elapsed >= (lease_ticks >> 1)) {    /* T1: renew */
@@ -283,7 +366,7 @@ static void dhcp_tick(void)
         if (elapsed >= lease_ticks) {             /* lease lost */
             memset(my_ip, 0, 4);
             dhcp_start();
-        } else if (++wait_ticks >= 3) {
+        } else if (++wait_ticks >= DHCP_RETRY_TICKS) {
             wait_ticks = 0;
             dhcp_send(3, 0, 0, my_ip);
         }
@@ -336,7 +419,8 @@ static uint8_t dhcp_rx(void)
     } else if (type == 5 && (state == S_REQUESTING || state == S_RENEWING)) { /* ACK */
         if (state == S_REQUESTING) memcpy(my_ip, &rx[58], 4);
         if (lease == 0) lease = 3600;
-        lease_ticks = (lease / TICK_X10) * 10;                    /* seconds -> ticks */
+        if (lease > 0x0FFFFFFFul) lease = 0x0FFFFFFFul;
+        lease_ticks = (lease >> 1) * 5;                           /* seconds -> ~0.4 s ticks */
         if (lease_ticks < 4) lease_ticks = 4;
         elapsed = 0;
         wait_ticks = 0;
@@ -418,14 +502,17 @@ static void handle_ip(void)
 /* -------------------------------------------------------------- main ----- */
 void main(void)
 {
+    OSCTUNE = 0x40;                         /* PLL on: 25 MHz -> 41.67 MHz (as Telldus firmware) */
+    ADCON1 = 0x0F;                          /* all pins digital */
     eth_init();
     T0CON = T0CON_VAL;
     INTCON &= ~INTCON_TMR0IF;
-    dhcp_start();
+    state = S_INIT;                         /* DISCOVER is sent once the link is up */
 
     for (;;) {
         if (INTCON & INTCON_TMR0IF) {
             INTCON &= ~INTCON_TMR0IF;
+            pol_tick();
             dhcp_tick();
         }
 

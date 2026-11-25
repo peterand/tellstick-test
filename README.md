@@ -14,7 +14,9 @@ The responder is silent until a lease is obtained.
 
 Check: the internal PHY needs a 25 MHz crystal (config `FOSC=HSPLL`). Confirm on your board.
 Find the assigned IP in your router's DHCP lease list (client MAC = `MY_MAC`).
-DHCP timing uses Timer0 (~1.6 s ticks) and assumes Fosc = 41.667 MHz.
+DHCP timing uses Timer0 (~0.4 s ticks) and assumes Fosc = 41.667 MHz (`OSCTUNE = 0x40`, as in the Telldus firmware).
+RE1 drives the board's Ethernet RX polarity swap; the code toggles it until the first frame is received.
+The LEDs on RA0/RA1 are the Ethernet link/activity LEDs.
 Untested on hardware; it was only syntax-checked on a host compiler.
 
 ## Test
