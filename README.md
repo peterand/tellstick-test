@@ -3,7 +3,7 @@
 Bare-metal firmware for PIC18F67J60 (internal Ethernet MAC/PHY, no TCP/IP stack).
 Gets its IP via DHCP (renews at half the lease, restarts on NAK/expiry).
 Receives UDP to 255.255.255.255:30303 (or its own IP) and replies "Hello Peter"
-to the sender, UDP destination port 2048 (source port 30303). Also answers ARP.
+to the sender, UDP destination port 2048 (source port 30303). Also answers ARP, sends a gratuitous ARP on a new lease, and answers ping (ICMP echo).
 The responder is silent until a lease is obtained.
 
 ## Build (MPLAB X + XC8)

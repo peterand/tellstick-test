@@ -5,7 +5,8 @@
  *   half the lease, restarts if the lease expires or a NAK arrives).
  * - Listens for UDP to 255.255.255.255 (or its own IP) port 30303 and answers
  *   the sender with "Hello Peter" to UDP destination port 2048.
- * - Answers ARP for its IP.
+ * - Answers ARP for its IP, announces it with a gratuitous ARP when a new
+ *   lease is obtained, and answers ICMP echo requests (ping).
  *
  * Bare-metal on the PIC's internal Ethernet MAC/PHY (no Microchip TCP/IP
  * stack). Toolchain: MPLAB X + XC8, device PIC18F67J60. Assumes a 25 MHz
@@ -261,6 +262,8 @@ static uint16_t ip_checksum(const uint8_t *p, uint8_t len)
 }
 
 /* ================================================================ DHCP === */
+static void send_garp(void);
+
 enum { S_INIT, S_SELECTING, S_REQUESTING, S_BOUND, S_RENEWING };
 
 static uint8_t  state = S_INIT;
@@ -424,7 +427,12 @@ static uint8_t dhcp_rx(void)
         if (lease_ticks < 4) lease_ticks = 4;
         elapsed = 0;
         wait_ticks = 0;
-        state = S_BOUND;
+        if (state == S_REQUESTING) {
+            state = S_BOUND;
+            send_garp();                                          /* announce new address */
+        } else {
+            state = S_BOUND;
+        }
     } else if (type == 6) {                                       /* NAK */
         memset(my_ip, 0, 4);
         dhcp_start();
@@ -452,6 +460,66 @@ static void handle_arp(void)
     eth_send(tx, 42);
 }
 
+/* Gratuitous ARP: tells the LAN (and router) who owns our new address. */
+static void send_garp(void)
+{
+    memset(&tx[0], 0xFF, 6);
+    memcpy(&tx[6], MY_MAC, 6);
+    tx[12] = 0x08; tx[13] = 0x06;
+    tx[14] = 0; tx[15] = 1; tx[16] = 0x08; tx[17] = 0; tx[18] = 6; tx[19] = 4;
+    tx[20] = 0; tx[21] = 1;                         /* request */
+    memcpy(&tx[22], MY_MAC, 6);
+    memcpy(&tx[28], my_ip, 4);                      /* sender IP = our IP */
+    memset(&tx[32], 0, 6);
+    memcpy(&tx[38], my_ip, 4);                      /* target IP = our IP */
+    eth_send(tx, 42);
+}
+
+/* -------------------------------------------------------------- ICMP ----- */
+/* Echo reply: headers built in tx[], payload streamed from the RX buffer
+ * (ERDPT is already at byte RXBUF_LEN) straight into the TX buffer. */
+static void handle_icmp(void)
+{
+    uint16_t i, csum;
+    uint32_t sum;
+
+    if (rx[14] != 0x45) return;                     /* 20-byte IP header only */
+    if (memcmp(&rx[30], my_ip, 4) != 0) return;     /* unicast to us */
+    if (rx[34] != 8 || rx[35] != 0) return;         /* echo request */
+    if (rx_len < 42 || rx_len > 1400) return;
+
+    memcpy(&tx[0], &rx[6], 6);
+    memcpy(&tx[6], MY_MAC, 6);
+    tx[12] = 0x08; tx[13] = 0x00;
+    tx[14] = 0x45; tx[15] = 0;
+    tx[16] = rx[16]; tx[17] = rx[17];               /* same total length */
+    tx[18] = 0; tx[19] = 0; tx[20] = 0; tx[21] = 0;
+    tx[22] = 64; tx[23] = 1;                        /* ttl, ICMP */
+    tx[24] = 0; tx[25] = 0;
+    memcpy(&tx[26], my_ip, 4);
+    memcpy(&tx[30], &rx[26], 4);
+    csum = ip_checksum(&tx[14], 20);
+    tx[24] = csum >> 8; tx[25] = (uint8_t)csum;
+
+    /* type 8 -> 0 changes one 16-bit word by 0x0800: RFC 1624 incremental update */
+    sum = (uint16_t)~(((uint16_t)rx[36] << 8) | rx[37]);
+    sum += 0xF7FF;
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    csum = (uint16_t)~sum;
+    tx[34] = 0; tx[35] = 0;
+    tx[36] = csum >> 8; tx[37] = (uint8_t)csum;
+    memcpy(&tx[38], &rx[38], 4);                    /* id, seq */
+
+    eth_tx_start(rx_len);
+    for (i = 0; i < 42; i++) EDATA = tx[i];
+    for (i = 42; i < rx_len; i++) {
+        if (i < RXBUF_LEN) EDATA = rx[i];
+        else { uint8_t b = EDATA; EDATA = b; }      /* read from RX buffer, write to TX buffer */
+    }
+    eth_tx_go();
+}
+
 /* --------------------------------------------------------------- UDP ----- */
 static void handle_ip(void)
 {
@@ -465,6 +533,7 @@ static void handle_ip(void)
     if ((rx[14] >> 4) != 4) return;
     ihl = (rx[14] & 0x0F) * 4;
     if (ihl < 20 || (uint16_t)(14 + ihl + 4) > rx_buffered) return;
+    if (rx[14 + 9] == 1) { handle_icmp(); return; } /* ping */
     if (rx[14 + 9] != 17) return;                   /* UDP only */
     if (memcmp(&rx[14 + 16], bcast, 4) != 0 && memcmp(&rx[14 + 16], my_ip, 4) != 0) return;
 
