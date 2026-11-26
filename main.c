@@ -25,6 +25,7 @@ static const uint8_t MY_MAC[6] = {0xac, 0xca, 0x54, 0x00, 0x6C, 0xac}; /* locall
 #define LISTEN_PORT  30303u
 #define REPLY_PORT   2048u
 static const char REPLY_TEXT[] = "Hello Peter";
+static const char HOSTNAME[]   = "Tellstick-Snagg";   /* DHCP option 12 */
 
 /* Timer0: 16-bit, 1:64, Fcy = 10.4167 MHz (after OSCTUNE PLL) -> overflow
  * every ~0.40 s. DHCP timing and the RX polarity swap are counted in ticks. */
@@ -292,7 +293,8 @@ static uint8_t has_ip(void)
 static void dhcp_send(uint8_t msg, const uint8_t *req_ip, const uint8_t *srv_id,
                       const uint8_t *ciaddr)
 {
-    uint8_t  opt_len = 3 + 4 + 1;                 /* 53, 55(1,3), end */
+    uint8_t  hn_len = sizeof(HOSTNAME) - 1;
+    uint8_t  opt_len = 3 + 4 + 1 + 2 + hn_len;    /* 53, 55(1,3), end, 12(hostname) */
     uint16_t udp_len, ip_len, total, csum;
     uint8_t  i;
 
@@ -335,6 +337,8 @@ static void dhcp_send(uint8_t msg, const uint8_t *req_ip, const uint8_t *srv_id,
     EDATA = 53; EDATA = 1; EDATA = msg;
     if (req_ip) { EDATA = 50; EDATA = 4; for (i = 0; i < 4; i++) EDATA = req_ip[i]; }
     if (srv_id) { EDATA = 54; EDATA = 4; for (i = 0; i < 4; i++) EDATA = srv_id[i]; }
+    EDATA = 12; EDATA = hn_len;                   /* hostname */
+    for (i = 0; i < hn_len; i++) EDATA = (uint8_t)HOSTNAME[i];
     EDATA = 55; EDATA = 2; EDATA = 1; EDATA = 3;  /* want subnet mask, router */
     EDATA = 255;
 
