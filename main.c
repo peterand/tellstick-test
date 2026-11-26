@@ -30,6 +30,7 @@ static const char REPLY_TEXT[] = "Hello Peter";
  * every ~0.40 s. DHCP timing and the RX polarity swap are counted in ticks. */
 #define T0CON_VAL     0x85       /* TMR0ON, 16-bit, internal clock, prescaler 1:64 */
 #define DHCP_RETRY_TICKS 12u     /* ~4.8 s */
+#define KEEPALIVE_TICKS  150u    /* ~60 s: ARP the gateway so routers keep us "active" */
 
 /* ---- register bit masks ---- */
 #define ECON1_TXRST   0x80
@@ -263,6 +264,7 @@ static uint16_t ip_checksum(const uint8_t *p, uint8_t len)
 
 /* ================================================================ DHCP === */
 static void send_garp(void);
+static void send_arp_req(const uint8_t *target_ip);
 
 enum { S_INIT, S_SELECTING, S_REQUESTING, S_BOUND, S_RENEWING };
 
@@ -271,6 +273,9 @@ static uint8_t  my_ip[4];            /* valid in S_BOUND / S_RENEWING */
 static uint8_t  offered_ip[4];
 static uint8_t  server_id[4];
 static uint8_t  xid[4];
+static uint8_t  gateway[4];
+static uint8_t  have_gw;
+static uint8_t  ka_ticks;
 static uint8_t  wait_ticks;          /* ticks since last request was sent */
 static uint32_t elapsed;             /* ticks since lease start */
 static uint32_t lease_ticks;
@@ -345,7 +350,7 @@ static void dhcp_start(void)
     dhcp_send(1, 0, 0, 0);
 }
 
-/* Called about every 1.6 s. */
+/* Called about every 0.4 s. */
 static void dhcp_tick(void)
 {
     switch (state) {
@@ -375,6 +380,11 @@ static void dhcp_tick(void)
         }
         break;
     }
+
+    if (has_ip() && ++ka_ticks >= KEEPALIVE_TICKS) {
+        ka_ticks = 0;
+        send_arp_req(have_gw ? gateway : my_ip);  /* refresh router's ARP/neighbour entry for us */
+    }
 }
 
 /* Returns 1 if the frame was a DHCP packet (UDP dst port 68), else 0. */
@@ -383,7 +393,7 @@ static uint8_t dhcp_rx(void)
     uint16_t i, pos;
     uint8_t  code, olen, n, b, type = 0;
     uint8_t  optb[4], srv[4], cookie[4];
-    uint8_t  have_srv = 0;
+    uint8_t  have_srv = 0, have_router = 0, router[4];
     uint32_t lease = 0;
 
     if (rx_buffered < 62 || rx[14] != 0x45 || rx[23] != 17) return 0;
@@ -408,6 +418,7 @@ static uint8_t dhcp_rx(void)
         pos += olen;
         if (code == 53 && olen >= 1) type = optb[0];
         else if (code == 54 && olen == 4) { memcpy(srv, optb, 4); have_srv = 1; }
+        else if (code == 3 && olen >= 4) { memcpy(router, optb, 4); have_router = 1; }
         else if (code == 51 && olen == 4)
             lease = ((uint32_t)optb[0] << 24) | ((uint32_t)optb[1] << 16)
                   | ((uint16_t)optb[2] << 8) | optb[3];
@@ -421,6 +432,8 @@ static uint8_t dhcp_rx(void)
         dhcp_send(3, offered_ip, server_id, 0);
     } else if (type == 5 && (state == S_REQUESTING || state == S_RENEWING)) { /* ACK */
         if (state == S_REQUESTING) memcpy(my_ip, &rx[58], 4);
+        if (have_router) { memcpy(gateway, router, 4); have_gw = 1; }
+        ka_ticks = 0;
         if (lease == 0) lease = 3600;
         if (lease > 0x0FFFFFFFul) lease = 0x0FFFFFFFul;
         lease_ticks = (lease >> 1) * 5;                           /* seconds -> ~0.4 s ticks */
@@ -460,8 +473,10 @@ static void handle_arp(void)
     eth_send(tx, 42);
 }
 
-/* Gratuitous ARP: tells the LAN (and router) who owns our new address. */
-static void send_garp(void)
+/* ARP request from our IP/MAC for target_ip, broadcast. With target_ip == our
+ * own IP it is a gratuitous ARP (announces a new lease); with the gateway's
+ * IP it is a periodic keepalive that refreshes the router's neighbour entry. */
+static void send_arp_req(const uint8_t *target_ip)
 {
     memset(&tx[0], 0xFF, 6);
     memcpy(&tx[6], MY_MAC, 6);
@@ -471,8 +486,13 @@ static void send_garp(void)
     memcpy(&tx[22], MY_MAC, 6);
     memcpy(&tx[28], my_ip, 4);                      /* sender IP = our IP */
     memset(&tx[32], 0, 6);
-    memcpy(&tx[38], my_ip, 4);                      /* target IP = our IP */
+    memcpy(&tx[38], target_ip, 4);
     eth_send(tx, 42);
+}
+
+static void send_garp(void)
+{
+    send_arp_req(my_ip);
 }
 
 /* -------------------------------------------------------------- ICMP ----- */
